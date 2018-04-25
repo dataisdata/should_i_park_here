@@ -1,0 +1,312 @@
+---
+title: "Should I Park Here?"
+author: "Jacob Bedard"
+date: "April 17, 2018"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+## A Look at Auto Theft in Vancouver
+
+When my wife and I moved to Vancouver, we looked into moving to Gastown. It was full of beautiful lofts, the rents seemed so reasonable, and it looked like a really trendy neighborhood. But generally, I don't want to live anywhere I wouldn't want to park a car. It's kind of like a litmus test for me when it comes to apartment hunting.
+
+So, being me, I decided to see if any data was available to help me make this decision.
+
+I found some quality crime data made available by the city of Vancouver on the topic for 2003-2017. It allowed me to see where various types of crimes happen across the city, down to the hour, minute, and even the city block. And the neighborhood names and definitions matched Stats Canada's definitions. This is great because it allows us to easily attach and overlay other statistics on top of this crime data that can help someone understand and explain it.
+
+
+```{r echo=TRUE, results="hide", message=FALSE}
+library(knitr)
+opts_chunk$set(root.dir = 'D:/vancouver_crime')
+options(warn=-1)
+library(readr)
+library(leaflet)
+library(DT)
+library(reshape2)
+library(plotly)
+library(ggthemes)
+library(dplyr)
+options( java.parameters = "-Xmx16g" )
+```
+<br>
+
+## Getting the Data
+
+What was really special about this data was the quality of it, which stems from good data governance. If you aren't familiar with the topic, or with Stats Canada, you may not appreciate how good statistical data is in Canada. Every town, city, county, province, or any other political or statistical division Stats Canada observes has perfectly comparable metrics, quality standards, and collection methods.
+
+In this post, we're going to tie some basic population statistics to auto theft data to help us analyze the relative safety of different neighborhoods from this perspective.
+
+```{r message=FALSE}
+setwd("D:/vancouver_crime")
+# Read in our Vancouver crime file:
+crime_data = read_csv("crime_csv_all_years.csv")
+```
+<br>
+
+## Crime Over Time
+
+Has the rate of thefts of or from autos increased or decreased over time in Vancouver? We can take a look at the totals by year. Let's break out the categories 'theft from vehicles' and 'theft of vehicles' and analyze the data. 
+
+*Note: while a bicycle is also a vehicle, it's broken out as a separate category in this dataset.
+
+First, I'm going to get some data wrangling out of the way. The City of Vancouver saves their geolocations in a format that doesn't really jive with the standard used by Google Maps and a handful of other great mapping utilities (WGS84 a.k.a. Web Mercator). Expand the code section if you're interested in the geo-data-wrangling. Otherwise, skip ahead.
+
+```{r message=FALSE, out.width='100%'}
+#### Fix the coordinate system ####
+# So, this is one annoying thing gov't agencies do: almost never standardize on GIS coordinate systems.
+# These are 'Spatial Points' with a zone of 'UTM 10'
+# We want to map this easily, so let's get it into something more familiar and widely used: lats and lons
+# We'll use the package 'rgdal' to handle the transformation to latitutde and longitude:
+
+library(rgdal)
+# Pull the SP coordinates out and get them ready to convert:
+utmcoor = SpatialPoints(cbind(crime_data$X, crime_data$Y), proj4string=CRS("+proj=utm +zone=10"))
+# The field X = UTM Easting and Y = UTM Northing
+# I know the UTM zone because it's in the metadata the City of Vancouver provided along with the data: 
+# Link: http://data.vancouver.ca/datacatalogue/crime-data-attributes.htm#X
+longlatcoor = spTransform(utmcoor,CRS("+proj=longlat"))
+
+# Take the latitude and longitude out from this new data structure and plug them back into the original dataset:
+crime_data$lat = longlatcoor@coords[, 2]
+crime_data$lon = longlatcoor@coords[, 1]
+
+# Be a good Data Professional and check your work! Ensure your new lats and lons map out to the same places. 
+# I used this site to validate that they do: 
+# link: http://www.rcn.montana.edu/Resources/Converter.aspx
+# One odd-looking thing is that the X values of 0 converted to a longitude of 127.4887. 
+# This happens because a UTM zone has boundaries for latitudes. There are 60 of these UTM zones.
+# A zero X value actually indicates the edge of the zone, which has an actual lat associated with it.
+
+# We'll ignore these points when we map out individual incidents later.
+# Now we have our latitudes and longitudes, so we're done with the not-so-friendly GIS part of our work. Phew!
+# You can optionally toss these X and Y values after transforming and validating. We don't need them now. Personally, I like to toss
+# stuff right away. Sometimes I work with huge datasets and can't afford extra stuff eating my RAM. Sure, there are workarounds, but
+# tossing it is so much easier.
+crime_data = subset(crime_data, select = -c(X, Y))
+
+# Split out all the "Theft of Vehicle" and "Theft from Vehicle" incidents:
+auto_theft = subset(crime_data, grepl("Theft.*.Vehicle", TYPE) == TRUE)
+
+# How has the rate of auto theft and theft from autos changed from 2003 to 2017?
+library(sqldf)
+theft_by_year = sqldf("SELECT YEAR,
+                      COUNT(*) AS incidents
+                      FROM auto_theft
+                      WHERE YEAR < 2018
+                      GROUP BY YEAR
+                      ORDER BY YEAR;")
+
+quick_yrly_crime_plot = ggplot(data = theft_by_year, aes(x = YEAR, y = incidents)) +
+  geom_line(color = "#3c78d8", size = 1.5) +
+  geom_point(color = '#3c78d8', size = 2.5) +
+  xlab("Year") +
+  ylab("# Incidents\n") +
+  ggtitle("Theft of or From Autos in Vancouver\n2003 - 2017\n") +
+  theme_hc()
+ggplotly(quick_yrly_crime_plot)
+```
+<br>
+
+Wow! That's a huge drop from 2004 to 2010/2011. My guess is the City took on some major initiatives to reduce crime rates of all sorts leading up to the Vancouver Olympics in 2010. It's been on the rise steadily since 2011, though. It's not as high as before, but it's outpacing population growth.
+
+## All Good in the 'Hood?
+
+Now, let's jump into my original question about neighborhoods. Let's summarize auto crimes by neighborhood.
+
+``` {r , out.width='100%'}
+nbhd_summary = sqldf("SELECT NEIGHBOURHOOD,
+                     COUNT(*) AS incidents
+                     FROM auto_theft
+                     GROUP BY NEIGHBOURHOOD;")
+# We've got some crimes with no neighborhood listed. Let's label those explicitly to improve readability for our audience.
+# We'll label all the missing values, but leave the reast as they are:
+nbhd_summary$NEIGHBOURHOOD = case_when(is.na(nbhd_summary$NEIGHBOURHOOD) == TRUE ~ "None Listed",
+                                       is.na(nbhd_summary$NEIGHBOURHOOD) == FALSE~ nbhd_summary$NEIGHBOURHOOD)
+# Now sort it:
+nbhd_summary = nbhd_summary[order(-nbhd_summary$incidents),]
+# View it:
+DT::datatable(nbhd_summary, style = "bootstrap", rownames = FALSE)
+```
+<br>
+
+Ok, that's a good start, but now I'm thinking about whether this is a fair picture. Even a safe neighborhood will have a sizable number of thefts if it's big enough. I want some sort of relative measure, like a per capita measure. This is where we see about layering on some new data to improve our insight.
+
+I'll add some population statistics for each neighborhood to come up with a better metric. It won't be perfect, though; ideally, we'd want to know about how many people live in the area as well as how many people pass through in a day. Since that could be a huge project unto itself, we'll just use population for this. Let's make a measure of auto thefts per 1,000 residents and plot it out.
+
+I have census data from 2016 here. Neighborhood populations can change, so I have to make sure to compare with 2016 crime data so I don't understate or overstate any statistics. It's vital not to be a slob about your data.
+
+``` {r message=FALSE, out.width='100%'}
+# Question 1 - extended: Maybe some of these neighborhoods are just bigger. Having more crimes doesn't necessarily make a 
+# large neighborhood less safe. How about an incidents per capita metric? I'd need population for each neighborhood to do that.
+
+# I can grab some recent (2016) census data, luckily. I'll get it from Vancouver's open data repository:
+# http://data.vancouver.ca/datacatalogue/
+# VPD and Stats Canada both use (almost exactly) the same names for neighborhoods. This sort of thing is always a nice surprise.
+# I looked up 'central business district' and it corresponds to Stats Canada's 'downtown' definition, so I renamed 'downtown'
+# to match my original dataset's neighborhood names.
+# Now we can just reshape it and then join it up. No manual renaming of anything involved.
+setwd("D:/vancouver_crime")
+census_data = na.omit(read_csv("CensusLocalAreaProfiles2016.csv"))
+
+# Now reshape it so the neighborhood names are all in one column:
+census_data_long = melt(census_data, id = c("Variable", "ID"))
+
+# And rename 'variable so it doesn't clash with the existing column named that:
+colnames(census_data_long) = c("Variable", "ID", "Neighbourhood", "value")
+
+# That gives us a dataframe where the neighborhood names are in a column called 'variable'
+# We're after the total population of the neighborhood, which is labelled with ID 1. 
+
+# Let's do incidents per year per capita for 2016 now. Let's grab auto thefts for 2016 and join it with the total populations
+# of each neighborhood for that same year:
+autothefts_2016 = subset(auto_theft, YEAR == 2016)
+
+nbhd_summary_2016 = sqldf("SELECT autothefts_2016.NEIGHBOURHOOD,
+                     COUNT(*) AS total_incidents,
+                     census_data_long.value AS population
+                     FROM autothefts_2016
+                      LEFT JOIN census_data_long ON census_data_long.Neighbourhood = autothefts_2016.NEIGHBOURHOOD
+                     WHERE census_data_long.ID = 1
+                     GROUP BY autothefts_2016.NEIGHBOURHOOD;")
+
+# Now we have population right next to it. Let's create a calculated column for incidents per 1,000 residents.
+nbhd_summary_2016$PerThousand = nbhd_summary_2016$total_incidents / (nbhd_summary_2016$population / 1000)
+
+nbhd_summary_2016 = nbhd_summary_2016[order(nbhd_summary_2016$PerThousand), ]
+nbhd_summary_2016$NEIGHBOURHOOD = factor(nbhd_summary_2016$NEIGHBOURHOOD, levels = nbhd_summary_2016$NEIGHBOURHOOD)
+
+# And visualize
+per_capita_viz_1 = ggplot(data = nbhd_summary_2016) +
+  aes(x= NEIGHBOURHOOD, y = PerThousand, text = paste("Total Incidents: ", total_incidents)) +
+  geom_bar(stat = "identity", fill = "#3c78d8") +
+  ylab("Thefts of autos or from autos, per capita") +
+  xlab("") +
+  ggtitle("Vancouver Neighbourhoods: Auto Theft Stats (2016)") +
+  coord_flip() +
+  theme_hc()
+
+ggplotly(per_capita_viz_1)
+```
+<br>
+
+So, Central Business District (Downtown) is far and away the worst spot, on both an absolute and relative scale. Ok, so I now have
+A fairly good idea of where not to park. But how concentrated are these thefts? I mean, if I do have to park downtown, should I just try to avoid certain areas? 
+
+As it turns out, yes! There are some extreme hotspots to be avoided if possible.
+
+## Plotting Crimes
+
+Let's pick a good way to visualize this: a map. And not just any map; we should use an interactive one! I'm going to use <i>Leaflet</i> here because it's powerful and easy (and pretty fun to work with). It also lets me make a custom location marker with a vector graphic of a little guy breaking into a car (neat, right?).
+ 
+```{r message=FALSE, out.width='100%'}
+library(maps)
+library(leaflet)
+setwd("D:/vancouver_crime")
+# I'm going to spice up my visual by making a little car thief icon to use as markers on my map:
+autotheft_icon = makeIcon("autothefticon.png", iconWidth = 50, iconHeight = 50)
+
+van_map = leaflet(data = autothefts_2016) %>%
+ # Leaflet allows you to use various 3rd-party map styles. I like this one (Toner Lite) because it doesn't distract from the data:
+  addProviderTiles(providers$Stamen.TonerLite, options = providerTileOptions(opacity = 0.45)) %>%
+  addMarkers(icon = autotheft_icon,
+ # Now I'm going to create detailed tooltips. You can use HTML line breaks to create multi-line
+ # tooltips with lots of information for users:
+    popup = paste0("Description: ", autothefts_2016$TYPE, "<br>",
+                  "Location: ", autothefts_2016$HUNDRED_BLOCK, "<br>",
+                  "Date: ", autothefts_2016$YEAR, "-", autothefts_2016$MONTH, "-", autothefts_2016$DAY, "<br>",
+                  "Time: ", autothefts_2016$HOUR, ":", autothefts_2016$MINUTE
+                  ), 
+ # Applying clustering to keep the map tidy without losing the ability to get high detail by zooming in:
+    clusterOptions = markerClusterOptions(maxClusterRadius = 100))
+  
+van_map
+```
+<br>
+
+Having this plotted as an interactive map tells quite the story. We can see some extreme concentrations here, and I happen to know from driving around town that many of them line up with parkades and lots. Some, like the lot on Abbot and Pender, are tiny and have massive theft rates. A few other nearby parkades on West Pender have very high theft rates too. I definitely don't recommend parking there!
+
+## Mean Streets
+
+Now, this data is all in the format of hundred blocks (i.e. 4XX W 15th Ave, etc.). I want to develop rules of thumb as to where to avoid leaving a car, and it's kind of tough to remember hundred blocks of streets when you're deciding where to park your car. Personally, I think I'm more likely to remember streets. We can extract just the street names from the 'hundred block' field.
+
+Let's summarize by streets and take a look at how bad they are. Here, I'll use a histogram because it shows how many streets are at varying levels of severity. Use clicking and dragging to zoom in on certain ranges to get a better picture.
+
+```{r message=FALSE, out.width='100%'}
+# Now, are there any especially bad streets that should really be avoided? Let's remove the hundred block part of the street names
+# and get total incidents by street. I'll remove anything from the hundred block names that has a number followed by 'XX' or 'XXX':
+
+auto_theft$street = gsub("^\\d*X*\\s", "", auto_theft$HUNDRED_BLOCK)
+
+thefts_by_street = sqldf("SELECT street AS \"Street\",
+                         COUNT(*) AS \"Total_Incidents\"
+                         FROM auto_theft
+                         GROUP BY street;")
+
+theft_by_street_hist = ggplot(data = thefts_by_street, aes(Total_Incidents)) +
+  geom_histogram(bins = 100, fill = '#3c78d8') +
+  ylab("Count") +
+  xlab("Total Incidents") +
+  scale_x_continuous(breaks = seq(100, max(thefts_by_street$Total_Incidents), by = 300)) +
+  theme_hc()
+  
+ggplotly(theft_by_street_hist)
+```
+<br>
+The distribution shows most streets have very few reported thefts, but also shows some crazy outliers. Let's dig into those and chart out the 25 worst streets. Well, I mean worst streets from a crime rate perspective. I'm sure they've all got a certain charm.
+
+```{r message=FALSE, out.width='100%'}
+# Okay, many streets with very few auto thefts over this 15 year period, but look at that range! There are some streets with 
+# unbelievable auto theft rates. Let's see the worst 25:
+# Sorth the full streets dataframe:
+thefts_by_street = thefts_by_street[order(-thefts_by_street$Total_Incidents),]
+
+# And take the top 25:
+mean_streets = thefts_by_street[1:25,]
+
+#Change the sorting so I can create a horizontal bar chart:
+mean_streets = mean_streets[order(mean_streets$Total_Incidents),]
+
+mean_streets$Street = factor(mean_streets$Street, levels = mean_streets$Street)
+
+mean_streets_viz_1 = ggplot(data = mean_streets) +
+  aes(x= Street, y = Total_Incidents) +
+  geom_bar(stat = "identity", fill = "#ff4d4d") +
+  ylab("Thefts of autos or from autos") +
+  xlab("") +
+  ggtitle("Vancouver's 25 Worst Streets to Park on") +
+  coord_flip() +
+  theme(axis.text.y = element_text(angle = 30)) +
+  theme_hc()
+
+ggplotly(mean_streets_viz_1)
+```
+<br>
+
+##That's a wrap!
+
+This analysis can go a few steps further in a few different directions, but I think by now we've got a very good idea of where not to park, so that does it for now.
+
+If you're interested in drilling into any other questions stemming from or related to this, I've made all the data and code available on <a href="https://github.com/dataisdata/should_i_park_here">github</a>. If you want to examine bike thefts, for example, you can just make a few tweaks to the filters and produce the whole analysis for that new topic.
+
+Stay tuned for more articles, and in the meantime, stay curious!
+<br><br>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
